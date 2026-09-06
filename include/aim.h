@@ -121,6 +121,16 @@ int  aim_t3_tile(const aim_t3_mat *m, aim_t3_tiled *t);
 void aim_t3_tiled_free(aim_t3_tiled *t);
 /* variante C: AVX2, attivazioni int8 per-tensore, tabelle int16 via vpshufb */
 void aim_t3_gemv_simd(const aim_t3_tiled *t, const float *x, float *y);
+
+/* ------------------------------------------------------------------ */
+/* 4. GEMM per il prefill: B attivazioni sugli stessi pesi              */
+/* ------------------------------------------------------------------ */
+/* Con la LUT il calcolo per token non si ammortizza. Qui ogni tile viene
+ * spacchettato una volta in int8 (colonne interleaved a 4) e moltiplicato
+ * per tutti i B token con vpdpbusd (AVX-VNNI) o vpmaddubsw (AVX2).
+ * X: B righe di `cols` float (stride ldx); Y: B righe di `rows` (stride ldy). */
+void aim_t3_gemm_simd(const aim_t3_tiled *t, const float *X, int ldx, int B, float *Y, int ldy);
+
 #ifdef __cplusplus
 }
 #endif

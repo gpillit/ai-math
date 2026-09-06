@@ -58,7 +58,13 @@ int main(int argc, char **argv)
     /* prefill: un token alla volta */
     t0 = aim_now_sec();
     const float *logits = NULL;
-    for (int i = 0; i < n_ids && c.pos < ctx; i++) {
+    const char *eb = getenv("AIM_BATCH");
+    int batch = eb ? atoi(eb) : 32;
+    if (batch < 1) batch = 1;
+    for (int i = 0; i < n_ids && c.pos < ctx; ) {
+        int nb = n_ids - i < batch ? n_ids - i : batch;
+        if (nb + c.pos > ctx) nb = ctx - c.pos;
+        if (nb > 1 && !getenv("AIM_DUMP")) { logits = aim_forward_batch(&c, ids + i, nb); i += nb; continue; }
         logits = aim_forward(&c, ids[i]);
         if (getenv("AIM_DUMP")) {
             int top[5]; float lv[5];
@@ -68,6 +74,7 @@ int main(int argc, char **argv)
                     if (logits[v] > lv[k]) { for (int j = 4; j > k; j--) { lv[j] = lv[j-1]; top[j] = top[j-1]; } lv[k] = logits[v]; top[k] = v; break; }
             fprintf(stderr, "pos %d top5: [%d, %d, %d, %d, %d] [%.3f, %.3f, %.3f, %.3f, %.3f]\n", i, top[0], top[1], top[2], top[3], top[4], lv[0], lv[1], lv[2], lv[3], lv[4]);
         }
+        i++;
     }
     double t_prefill = aim_now_sec() - t0;
 
@@ -86,10 +93,10 @@ int main(int argc, char **argv)
     double t_dec = aim_now_sec() - t0;
     int dec_steps = generated - 1 > 0 ? generated - 1 : 1;
 
-    fprintf(stderr, "prefill: %d token in %.2f s (%.1f tok/s)\n", n_ids, t_prefill, n_ids / t_prefill);
+    fprintf(stderr, "prefill: %d token in %.2f s (%.1f tok/s, batch %d)\n", n_ids, t_prefill, n_ids / t_prefill, batch);
     fprintf(stderr, "decode : %d token in %.2f s (%.1f tok/s, %.1f ms/token)\n",
             generated, t_dec, dec_steps / t_dec, 1e3 * t_dec / dec_steps);
-    double steps = n_ids + dec_steps;
+    double steps = n_ids + dec_steps;   /* medie su prefill+decode (il prefill a batch le abbassa) */
     fprintf(stderr, "per token: gemv ternari %.1f ms, attention %.1f ms, lm_head %.1f ms\n",
             1e3 * c.t_gemv / steps, 1e3 * c.t_attn / steps, 1e3 * c.t_head / steps);
     fprintf(stderr, "banda pesi ternari nei gemv: %.1f GB/s\n", m.ternary_bytes / (c.t_gemv / steps) / 1e9);

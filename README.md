@@ -4,8 +4,9 @@ Laboratorio in C per **nuove strutture algebriche orientate all'inferenza LLM
 memory-bound** (tutto il modello in RAM, calcolo su CPU).
 
 Stato: un modello reale (BitNet b1.58 2B-4T) gira end-to-end sopra la
-struttura ternaria in base 3, in 750 MB di RAM, a **30-34 token/s** su un
-portatile (Core Ultra 7 155U, 15 W). Risposte corrette e coerenti.
+struttura ternaria in base 3, in 750 MB di RAM, a **30-34 token/s** in
+generazione e **90-105 token/s** in prefill su un portatile (Core Ultra 7
+155U, 15 W). Risposte corrette e coerenti.
 
 ## Il vincolo fisico che guida tutto
 
@@ -33,6 +34,18 @@ La struttura di gruppo Z₃⁵ = Z₃³ × Z₃² dà la fattorizzazione
 nei registri SIMD. La divisione per 27 su un byte è esatta come `(b·19) >> 9`,
 oppure `mulhi(b, 2432)`. Con AVX2 la lookup è `vpshufb` su 32 righe per volta.
 
+## Struttura 1b: la stessa matrice, due algebre di calcolo
+
+Il layout in RAM è uno solo (base 3, tile di 32 righe). Sopra ci girano due
+kernel diversi a seconda del regime:
+
+- **decode (1 token)**: memory-bound → LUT via `vpshufb`, mai una
+  moltiplicazione (`src/ternary_fast.c`);
+- **prefill (B token)**: compute-bound → ogni tile viene spacchettato una
+  volta in int8 (colonne interleaved a 4) e moltiplicato per tutti i B token
+  con `vpdpbusd` (AVX-VNNI), correzione `128·Σw` con lo stesso kernel
+  (`src/ternary_gemm.c`). Nel bench: 360-500 GOPS, il limite del chip.
+
 ## Cosa c'è
 
 | file | contenuto |
@@ -40,7 +53,8 @@ oppure `mulhi(b, 2432)`. Con AVX2 la lookup è `vpshufb` su 32 righe per volta.
 | `include/aim.h` | API: semianello generico, matrice ternaria, layout a tile, thread pool |
 | `src/semiring.c` | GEMV parametrico su (⊕,⊗): reale, tropicale (max,+), log (lse,+) |
 | `src/ternary.c` | quantizzazione TWN, packing base 3, kernel LUT di riferimento |
-| `src/ternary_fast.c` | kernel: blocking di cache, fattorizzazione 27×9, AVX2 a tile |
+| `src/ternary_fast.c` | kernel GEMV: blocking di cache, fattorizzazione 27×9, AVX2 a tile |
+| `src/ternary_gemm.c` | kernel GEMM per il prefill: unpack a int8 per tile + AVX-VNNI |
 | `src/pool.c` | thread pool con barriere a spin e affinità ai core (libgomp costava 150 µs a chiamata) |
 | `src/int8.c` | GEMV int8 per l'lm_head |
 | `src/model.c`, `include/aim_model.h` | forward BitNet: RMSNorm, RoPE, GQA con KV cache, relu², sub-norm |
@@ -66,8 +80,9 @@ Chat:
     .venv/Scripts/python tools/chat.py "Explain why the sky is blue." -n 80
 
 Variabili: `AIM_THREADS` (default: tutti i core meno i 2 LP-E sulle CPU
-ibride; su questo portatile 10 è il migliore), `AIM_DUMP=1` stampa stato e
-top-5 per posizione (confrontabile con `tools/ref_forward.py`).
+ibride; su questo portatile 10 è il migliore), `AIM_BATCH` (token per batch
+nel prefill, default 32), `AIM_DUMP=1` stampa stato e top-5 per posizione
+(confrontabile con `tools/ref_forward.py`; forza batch 1).
 
 ## Risultati
 
@@ -78,7 +93,8 @@ top-5 per posizione (confrontabile con `tools/ref_forward.py`).
 | RAM | 750 MB (417 MB ternari a 1.60 bit/peso + 328 MB embedding/lm_head int8) |
 | decode | **30.7 ms/token (32.6 tok/s)** con 12 thread, 29.4 ms con 10 |
 | di cui | GEMV ternari 20-22 ms (19-21 GB/s), lm_head 8.3 ms (39 GB/s, al tetto), attention 0.5 ms |
-| prefill | un token alla volta, stessa velocità del decode |
+| prefill | **9.6-11 ms/token (90-105 tok/s)** con batch 64 (`AIM_BATCH`, default 32); batch 1: 32 tok/s |
+| di cui | GEMM 8-9.5 ms, attention 0.7 ms (scalare, cresce col contesto) |
 
 ### Kernel isolato, 4096×4096 (un GEMV = un token su un layer)
 
@@ -88,6 +104,7 @@ top-5 per posizione (confrontabile con `tools/ref_forward.py`).
 | ternario, LUT T[243] scalare | 3.4 MB | 0.49 | 7 | 3.2× |
 | ternario, LUT con blocking L1 | 3.4 MB | 0.40 | 8.4 | 3.9× |
 | ternario, 27×9 AVX2 a tile | 3.4 MB | **0.185** | 18 | **8.4×** |
+| GEMM VNNI, 32 token | 3.4 MB | 2.1 (0.066/token) | | 508 GOPS |
 
 Regime DRAM (54 MB): 1.42 ms, **38 GB/s**, cioè il tetto di banda della
 macchina. Il kernel isolato è RAM-bound; nel modello le matrici sono più
@@ -123,9 +140,10 @@ letteratura prima di chiamarla nuova.
 
 ## Prossimi passi candidati
 
-1. Prefill a batch (GEMM invece di GEMV): i pesi si leggono una volta per
-   tutto il prompt invece che per ogni token.
-2. Confronto diretto con bitnet.cpp sulla stessa macchina.
+1. Confronto diretto con bitnet.cpp sulla stessa macchina. Richiede cmake e
+   clang (non installati) e il suo generatore di kernel; non ancora fatto.
+2. Attention vettorizzata (oggi scalare: 0.7 ms/token nel prefill a 126
+   token, cresce con il contesto).
 3. Cambio di semianello dentro il modello: layer in (max,+), niente
    moltiplicazioni né tabelle. Richiede fine-tuning.
 4. Pesi su reticoli non cubici (esagonale / Eisenstein): più precisione per bit.

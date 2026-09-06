@@ -74,6 +74,20 @@ int main(int argc, char **argv)
     t = bench(k_t3simd, &tl, x, y, iters);
     e = aim_rel_err(y_ref, y, rows);
     printf("%-22s %12zu %10.3f %12.1f %10.3f\n", "ternary b3 27x9 AVX2", bytes_t3, t * 1e3, bytes_t3 / t / 1e9, e);
+    for (int B = 8; B <= 64; B *= 4) {
+        float *X = malloc((size_t)B * cols * sizeof(float)), *Y = malloc((size_t)B * rows * sizeof(float));
+        aim_fill_gaussian(X, (size_t)B * cols, 9);
+        aim_t3_gemm_simd(&tl, X, cols, B, Y, rows);
+        double best = 1e30;
+        for (int i = 0; i < iters; i++) {
+            double t0 = aim_now_sec(); aim_t3_gemm_simd(&tl, X, cols, B, Y, rows); double tt = aim_now_sec() - t0;
+            if (tt < best) best = tt;
+        }
+        char name[32]; snprintf(name, sizeof name, "gemm VNNI B=%d", B);
+        printf("%-22s %12zu %10.3f %12.1f %10s  (%.1f ms/token, %.0f GOPS)\n", name, bytes_t3, best * 1e3,
+               bytes_t3 / best / 1e9, "-", best * 1e3 / B, 2.0 * rows * cols * B / best / 1e9);
+        free(X); free(Y);
+    }
     aim_t3_tiled_free(&tl);
 
     printf("\ncompressione pesi: %.1fx   (%.2f bit/peso incluse le scale)\n",

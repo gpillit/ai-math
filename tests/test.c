@@ -85,6 +85,22 @@ int main(void)
     double e_simd = aim_rel_err(y0, y2, rows);
     printf("      errore simd con x gaussiana (quantizzazione int8 attivazioni): %.2e\n", e_simd);
     CHECK(e_simd < 2e-2, "t3_gemv_simd ~ fp32 su x gaussiana (< 2%)");
+    /* GEMM a batch == GEMV riga per riga (stessa quantizzazione per token) */
+    {
+        int B = 5;
+        float *X = malloc((size_t)B * cols * sizeof(float)), *Y = malloc((size_t)B * rows * sizeof(float));
+        aim_fill_gaussian(X, (size_t)B * cols, 7);
+        aim_t3_gemm_simd(&tl, X, cols, B, Y, rows);
+        double worst = 0;
+        for (int b = 0; b < B; b++) {
+            aim_t3_gemv_simd(&tl, X + (size_t)b * cols, y2);
+            double e = aim_rel_err(y2, Y + (size_t)b * rows, rows);
+            if (e > worst) worst = e;
+        }
+        printf("      gemm vs gemv, errore massimo su %d token: %.2e\n", B, worst);
+        CHECK(worst < 1e-5, "t3_gemm_simd == t3_gemv_simd per ogni token");
+        free(X); free(Y);
+    }
     aim_t3_tiled_free(&tl);
     free(xi);
 

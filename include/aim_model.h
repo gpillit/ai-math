@@ -43,6 +43,8 @@ int   aim_ctx_init(aim_ctx *c, const aim_model *m, int max_ctx);
 void  aim_ctx_free(aim_ctx *c);
 /* un passo: consuma `token` alla posizione corrente, ritorna i logit [vocab] */
 const float *aim_forward(aim_ctx *c, int token);
+/* B token in batch (prefill): ritorna i logit dell'ultimo, avanza pos di B */
+const float *aim_forward_batch(aim_ctx *c, const int *tokens, int B);
 int   aim_argmax(const float *v, int n);
 
 /* GEMV int8 (pesi int8 per riga con scala, attivazioni int8 per-tensore) */

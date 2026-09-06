@@ -122,8 +122,12 @@ static void rope(float *v, int n_heads, int hd, const float *cs, const float *sn
 }
 
 typedef struct {
-    aim_ctx *c; const float *q, *kbase, *vbase;
-    int pos, kvd, HD, NH, group; float scale;
+    aim_ctx *c;
+    const float *q;   int ldq;     /* query del token b: q + b*ldq + h*HD */
+    float *out;       int ldo;     /* output: out + b*ldo + h*HD */
+    float *sc;                     /* scratch: (b*NH + h) * max_ctx */
+    const float *kbase, *vbase;
+    int pos0, B, kvd, HD, NH, group; float scale;
     atomic_int next;
 } attn_task;
 
@@ -131,12 +135,12 @@ static void attn_task_fn(void *ctx, int tid, int nth)
 {
     (void)tid; (void)nth;
     attn_task *a = ctx;
-    aim_ctx *c = a->c;
-    const int HD = a->HD, pos = a->pos, kvd = a->kvd;
-    for (int h; (h = aim_pool_next(&a->next, 1)) < a->NH;) {
-        const float *qh = a->q + h * HD;
-        int kh = h / a->group;
-        float *sc = c->att + (size_t)h * c->max_ctx;
+    const int HD = a->HD, kvd = a->kvd, NH = a->NH, max_ctx = a->c->max_ctx;
+    const int nitems = a->B * NH;
+    for (int it; (it = aim_pool_next(&a->next, 1)) < nitems;) {
+        const int b = it / NH, h = it % NH, pos = a->pos0 + b, kh = h / a->group;
+        const float *qh = a->q + (size_t)b * a->ldq + h * HD;
+        float *sc = a->sc + (size_t)it * max_ctx;
         float mx = -1e30f;
         for (int t = 0; t <= pos; t++) {
             const float *kt = a->kbase + (size_t)t * kvd + kh * HD;
@@ -148,7 +152,7 @@ static void attn_task_fn(void *ctx, int tid, int nth)
         float sum = 0;
         for (int t = 0; t <= pos; t++) { sc[t] = expf(sc[t] - mx); sum += sc[t]; }
         float inv = 1.0f / sum;
-        float *o = c->attn + h * HD;
+        float *o = a->out + (size_t)b * a->ldo + h * HD;
         for (int i = 0; i < HD; i++) o[i] = 0;
         for (int t = 0; t <= pos; t++) {
             const float *vt = a->vbase + (size_t)t * kvd + kh * HD;
@@ -198,8 +202,9 @@ const float *aim_forward(aim_ctx *c, int token)
         memcpy(kc, k, kvd * sizeof(float));
         memcpy(vc, v, kvd * sizeof(float));
 
-        attn_task at = { c, q, c->k_cache + (size_t)l * c->max_ctx * kvd, c->v_cache + (size_t)l * c->max_ctx * kvd,
-                         pos, kvd, HD, NH, group, att_scale, 0 };
+        attn_task at = { c, q, 0, c->attn, 0, c->att,
+                         c->k_cache + (size_t)l * c->max_ctx * kvd, c->v_cache + (size_t)l * c->max_ctx * kvd,
+                         pos, 1, kvd, HD, NH, group, att_scale, 0 };
         aim_pool_run(attn_task_fn, &at);
         c->t_attn += aim_now_sec() - t0; t0 = aim_now_sec();
 
@@ -226,5 +231,77 @@ const float *aim_forward(aim_ctx *c, int token)
     aim_gemv_i8(m->emb_q, m->emb_s, m->vocab, H, xb, c->logits);
     c->t_head += aim_now_sec() - t0;
     c->pos++;
+    return c->logits;
+}
+
+/* ---------------------------------------------------------------- batch */
+const float *aim_forward_batch(aim_ctx *c, const int *tokens, int B)
+{
+    const aim_model *m = c->m;
+    const int H = m->hidden, HD = m->head_dim, NH = m->n_heads, NKV = m->n_kv;
+    const int kvd = NKV * HD, half = HD / 2, pos0 = c->pos, I = m->inter;
+    const int group = NH / NKV, ldq = H + 2 * kvd;
+    const float att_scale = 1.0f / sqrtf((float)HD);
+
+    float *X   = malloc((size_t)B * H * sizeof(float));
+    float *XB  = malloc((size_t)B * H * sizeof(float));
+    float *QKV = malloc((size_t)B * ldq * sizeof(float));
+    float *ATT = malloc((size_t)B * H * sizeof(float));
+    float *GU  = malloc((size_t)B * 2 * I * sizeof(float));
+    float *HH  = malloc((size_t)B * I * sizeof(float));
+    float *SC  = malloc((size_t)B * NH * c->max_ctx * sizeof(float));
+
+    for (int b = 0; b < B; b++) {
+        const int8_t *e = m->emb_q + (size_t)tokens[b] * H;
+        float es = m->emb_s[tokens[b]];
+        for (int i = 0; i < H; i++) X[(size_t)b * H + i] = e[i] * es;
+    }
+
+    for (int l = 0; l < m->n_layers; l++) {
+        const aim_layer *L = &m->layers[l];
+        double t0 = aim_now_sec();
+        for (int b = 0; b < B; b++) rmsnorm(XB + (size_t)b * H, X + (size_t)b * H, L->ln1, H, m->eps);
+        double tk = aim_now_sec(); aim_t3_gemm_simd(&L->qkv, XB, H, B, QKV, ldq); c->t_kind[0] += aim_now_sec() - tk;
+        c->t_gemv += aim_now_sec() - t0; t0 = aim_now_sec();
+
+        for (int b = 0; b < B; b++) {
+            int pos = pos0 + b;
+            float *q = QKV + (size_t)b * ldq, *k = q + H, *v = k + kvd;
+            const float *cs = c->rope_cos + (size_t)pos * half, *sn = c->rope_sin + (size_t)pos * half;
+            rope(q, NH, HD, cs, sn);
+            rope(k, NKV, HD, cs, sn);
+            memcpy(c->k_cache + ((size_t)l * c->max_ctx + pos) * kvd, k, kvd * sizeof(float));
+            memcpy(c->v_cache + ((size_t)l * c->max_ctx + pos) * kvd, v, kvd * sizeof(float));
+        }
+        attn_task at = { c, QKV, ldq, ATT, H, SC,
+                         c->k_cache + (size_t)l * c->max_ctx * kvd, c->v_cache + (size_t)l * c->max_ctx * kvd,
+                         pos0, B, kvd, HD, NH, group, att_scale, 0 };
+        aim_pool_run(attn_task_fn, &at);
+        c->t_attn += aim_now_sec() - t0; t0 = aim_now_sec();
+
+        for (int b = 0; b < B; b++) rmsnorm(XB + (size_t)b * H, ATT + (size_t)b * H, L->attn_sub, H, m->eps);
+        tk = aim_now_sec(); aim_t3_gemm_simd(&L->o, XB, H, B, ATT, H); c->t_kind[1] += aim_now_sec() - tk;
+        for (size_t i = 0; i < (size_t)B * H; i++) X[i] += ATT[i];
+
+        for (int b = 0; b < B; b++) rmsnorm(XB + (size_t)b * H, X + (size_t)b * H, L->ln2, H, m->eps);
+        tk = aim_now_sec(); aim_t3_gemm_simd(&L->gate_up, XB, H, B, GU, 2 * I); c->t_kind[2] += aim_now_sec() - tk;
+        for (int b = 0; b < B; b++) {
+            const float *g = GU + (size_t)b * 2 * I, *u = g + I;
+            float *h = HH + (size_t)b * I;
+            for (int i = 0; i < I; i++) { float r = g[i] > 0 ? g[i] : 0; h[i] = r * r * u[i]; }
+            rmsnorm(h, h, L->ffn_sub, I, m->eps);
+        }
+        tk = aim_now_sec(); aim_t3_gemm_simd(&L->down, HH, I, B, XB, H); c->t_kind[3] += aim_now_sec() - tk;
+        for (size_t i = 0; i < (size_t)B * H; i++) X[i] += XB[i];
+        c->t_gemv += aim_now_sec() - t0;
+    }
+
+    double t0 = aim_now_sec();
+    rmsnorm(c->xb, X + (size_t)(B - 1) * H, m->final_norm, H, m->eps);
+    aim_gemv_i8(m->emb_q, m->emb_s, m->vocab, H, c->xb, c->logits);
+    c->t_head += aim_now_sec() - t0;
+    c->pos += B;
+
+    free(X); free(XB); free(QKV); free(ATT); free(GU); free(HH); free(SC);
     return c->logits;
 }
