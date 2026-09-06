@@ -72,6 +72,18 @@ extern int8_t aim_t3_decode[AIM_T3_CODES][AIM_T3_GROUP];
 void aim_t3_init(void);
 
 /* ------------------------------------------------------------------ */
+/* Thread pool persistente (dispatch e barriere a spin, ~1-2 us)       */
+/* ------------------------------------------------------------------ */
+#include <stdatomic.h>
+typedef void (*aim_task_fn)(void *ctx, int tid, int nth);
+void aim_pool_init(int n);            /* n<=0: AIM_THREADS o numero di CPU */
+void aim_pool_shutdown(void);
+int  aim_pool_size(void);
+void aim_pool_run(aim_task_fn fn, void *ctx);   /* fn su tutti i thread, attende la fine */
+void aim_pool_barrier(void);                    /* dentro un task */
+int  aim_pool_next(atomic_int *counter, int chunk);  /* scheduling dinamico */
+
+/* ------------------------------------------------------------------ */
 /* Utilità                                                             */
 /* ------------------------------------------------------------------ */
 double aim_now_sec(void);

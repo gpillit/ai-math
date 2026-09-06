@@ -8,6 +8,7 @@ static int fails = 0;
 
 int main(void)
 {
+    aim_pool_init(0);
     aim_t3_init();
 
     /* 1. la codifica base-3 è biunivoca sui 243 codici */

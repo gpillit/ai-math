@@ -235,18 +235,32 @@ static inline void t3_store_tile(const aim_t3_tiled *t, float sx, int r0,
     }
 }
 
-void aim_t3_gemv_simd(const aim_t3_tiled *t, const float *x, float *y)
+static int t3_chunk = 0, T3_PF = 24;   /* iterazioni per chunk; gruppi di prefetch (24*32 B = 768 B) */
+
+typedef struct {
+    const aim_t3_tiled *t;
+    const int8_t *xq;
+    uint8_t *TB;
+    float *y;
+    float sx;
+    atomic_int next_group, next_tile;
+} t3_task;
+
+static void t3_task_fn(void *ctx, int tid, int nth)
 {
-    const int G = t->G, cols = t->cols;
+    (void)tid;
+    t3_task *k = ctx;
+    const aim_t3_tiled *t = k->t;
+    const int G = t->G;
+    uint8_t *TB = k->TB;
 
-    /* attivazioni int8 simmetriche per-tensore */
-    float amax = 0;
-    for (int c = 0; c < cols; c++) { float a = fabsf(x[c]); if (a > amax) amax = a; }
-    const float sx = amax > 0 ? amax / 127.0f : 1.0f, inv = 1.0f / sx;
-    int8_t *xq = calloc(t->cols_pad, 1);
-    for (int c = 0; c < cols; c++) { float v = x[c] * inv; xq[c] = (int8_t)(v >= 0 ? v + 0.5f : v - 0.5f); }
-
-    uint8_t *TB = _mm_malloc((size_t)G * SIMD_TBL, 32);
+    /* fase 1: tabelle per gruppo (dinamico, chunk di 32 gruppi) */
+    for (int g0; (g0 = aim_pool_next(&k->next_group, 32)) < G;) {
+        int g1 = g0 + 32 < G ? g0 + 32 : G;
+        for (int g = g0; g < g1; g++)
+            build_group_tables(k->xq + g * AIM_T3_GROUP, TB + (size_t)g * SIMD_TBL);
+    }
+    aim_pool_barrier();
 
     const __m256i c2432 = _mm256_set1_epi16(2432);   /* mulhi(b, 19<<7) = b/27 per b < 243 */
     const __m256i c27   = _mm256_set1_epi16(27);
@@ -254,17 +268,17 @@ void aim_t3_gemv_simd(const aim_t3_tiled *t, const float *x, float *y)
     const int KFOLD = 48;  /* 48 * (381+254) < 32767: accumulo int16 sicuro */
     const int ntiles = t->rows_pad / AIM_T3_TILE;
     const size_t tile_bytes = (size_t)G * AIM_T3_TILE;
+    const float sx = k->sx;
+    float *y = k->y;
 
-    /* una sola regione parallela: tabelle, barriera implicita, poi i tile */
-    #pragma omp parallel
-    {
-        #pragma omp for
-        for (int g = 0; g < G; g++)
-            build_group_tables(xq + g * AIM_T3_GROUP, TB + (size_t)g * SIMD_TBL);
-
-        /* due tile per iterazione: le 6 tabelle caricate servono 64 righe */
-        #pragma omp for schedule(dynamic, 1) nowait
-        for (int tp = 0; tp < ntiles; tp += 2) {
+    /* fase 2: coppie di tile (dinamico). Due tile per iterazione: le 6
+     * tabelle caricate servono 64 righe; chunk grosso = tratto contiguo di RAM */
+    /* chunk adattivo: ~6 chunk per thread, cosi' la coda (E-core lenti) e' corta */
+    int step = t3_chunk > 0 ? 2 * t3_chunk : ntiles / (nth * 6);
+    step = step < 2 ? 2 : step > 16 ? 16 : (step & ~1);
+    for (int tp0; (tp0 = aim_pool_next(&k->next_tile, step)) < ntiles;) {
+        int tp1 = tp0 + step < ntiles ? tp0 + step : ntiles;
+        for (int tp = tp0; tp < tp1; tp += 2) {
             const int two = tp + 1 < ntiles;
             const uint8_t *td0 = t->data + (size_t)tp * tile_bytes;
             const uint8_t *td1 = two ? td0 + tile_bytes : td0;
@@ -280,9 +294,11 @@ void aim_t3_gemv_simd(const aim_t3_tiled *t, const float *x, float *y)
                 __m256i B_hi = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i *)(tb + 48)));
                 __m256i H_lo = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i *)(tb + 64)));
                 __m256i H_hi = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i *)(tb + 80)));
+                _mm_prefetch((const char *)(td0 + (size_t)(g + T3_PF) * AIM_T3_TILE), _MM_HINT_T0);
                 __m256i c0 = _mm256_loadu_si256((const __m256i *)(td0 + (size_t)g * AIM_T3_TILE));
                 T3_GROUP_STEP(c0, pa, pb);
                 if (two) {
+                    _mm_prefetch((const char *)(td1 + (size_t)(g + T3_PF) * AIM_T3_TILE), _MM_HINT_T0);
                     __m256i c1 = _mm256_loadu_si256((const __m256i *)(td1 + (size_t)g * AIM_T3_TILE));
                     T3_GROUP_STEP(c1, qa, qb);
                 }
@@ -296,7 +312,26 @@ void aim_t3_gemv_simd(const aim_t3_tiled *t, const float *x, float *y)
             if (two) t3_store_tile(t, sx, (tp + 1) * AIM_T3_TILE, q0, q1, q2, q3, y);
         }
     }
-    _mm_free(TB);
+}
+
+void aim_t3_gemv_simd(const aim_t3_tiled *t, const float *x, float *y)
+{
+    const int G = t->G, cols = t->cols;
+    if (!t3_chunk) {
+        const char *e = getenv("AIM_CHUNK"); t3_chunk = e ? atoi(e) : -1;   /* -1: adattivo */
+        e = getenv("AIM_PF"); if (e) T3_PF = atoi(e);
+    }
+
+    /* attivazioni int8 simmetriche per-tensore */
+    float amax = 0;
+    for (int c = 0; c < cols; c++) { float a = fabsf(x[c]); if (a > amax) amax = a; }
+    const float sx = amax > 0 ? amax / 127.0f : 1.0f, inv = 1.0f / sx;
+    int8_t *xq = calloc(t->cols_pad, 1);
+    for (int c = 0; c < cols; c++) { float v = x[c] * inv; xq[c] = (int8_t)(v >= 0 ? v + 0.5f : v - 0.5f); }
+
+    t3_task k = { t, xq, _mm_malloc((size_t)G * SIMD_TBL, 32), y, sx, 0, 0 };
+    aim_pool_run(t3_task_fn, &k);
+    _mm_free(k.TB);
     free(xq);
 }
 #else

@@ -31,6 +31,7 @@ static void k_t3simd(void *c, const float *x, float *y) { aim_t3_gemv_simd(c, x,
 
 int main(int argc, char **argv)
 {
+    aim_pool_init(0);
     int rows = argc > 1 ? atoi(argv[1]) : 4096;
     int cols = argc > 2 ? atoi(argv[2]) : 4096;
     int iters = argc > 3 ? atoi(argv[3]) : 20;
