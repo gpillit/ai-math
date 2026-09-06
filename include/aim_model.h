@@ -22,6 +22,7 @@ typedef struct {
     const float  *emb_s;   /* [vocab] */
     const float  *final_norm;
     aim_layer *layers;
+    aim_code *code;        /* NULL = ternario base 3 nativo */
     uint8_t *blob;
     size_t blob_size;
     size_t ternary_bytes;  /* byte letti per token dai layer ternari */

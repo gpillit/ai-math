@@ -110,11 +110,13 @@ void aim_t3_gemv_lut_factored(const aim_t3_mat *m, const float *x, float *y);
 
 /* Layout a tile per SIMD: 32 righe per tile, per ogni gruppo 32 byte contigui. */
 #define AIM_T3_TILE 32
+struct aim_code;
 typedef struct {
     int rows, cols, cols_pad, G;   /* G = byte per riga */
     int rows_pad;                  /* multiplo di 32 */
     uint8_t *data;                 /* (rows_pad/32) * G * 32 */
     float   *scale;                /* rows_pad */
+    const struct aim_code *code;   /* NULL = ternario base 3 nativo; altrimenti codice generico */
 } aim_t3_tiled;
 
 int  aim_t3_tile(const aim_t3_mat *m, aim_t3_tiled *t);
@@ -130,6 +132,42 @@ void aim_t3_gemv_simd(const aim_t3_tiled *t, const float *x, float *y);
  * per tutti i B token con vpdpbusd (AVX-VNNI) o vpmaddubsw (AVX2).
  * X: B righe di `cols` float (stride ldx); Y: B righe di `rows` (stride ldy). */
 void aim_t3_gemm_simd(const aim_t3_tiled *t, const float *X, int ldx, int B, float *Y, int ldy);
+
+
+/* ------------------------------------------------------------------ */
+/* 5. Codici a byte generici: G = insieme di n-uple di interi piccoli   */
+/* ------------------------------------------------------------------ */
+/* Un codice e' una biiezione tra al piu' 256 configurazioni ammesse di n
+ * pesi (valori interi in [-lev/2, lev/2]) e un byte. Esempi:
+ *   t5  : Z3^5, 243 codici, 1.60 bit/peso  (base 3, kernel dedicati)
+ *   q4  : Z4^4, 256 codici, 2.00 bit/peso  (2 bit per peso)
+ *   s36 : 6 pesi ternari con al piu' 3 non nulli, 233 codici, 1.33 bit/peso
+ *         (codice enumerativo: sparsita' strutturata 3:6 a lunghezza fissa)
+ * La tabella di lookup per gruppo ha ncodes voci: T[b] = sum_i dec[b][i]*x_i. */
+#define AIM_CODE_MAXW 8
+typedef struct aim_code {
+    const char *name;
+    int n;                              /* pesi per byte */
+    int ncodes;                         /* codici validi (<= 256) */
+    int levels;                         /* livelli per peso (3 = ternario) */
+    int kmax;                           /* max non nulli per gruppo (n = nessun vincolo) */
+    int8_t dec[256][AIM_CODE_MAXW];     /* codice -> valori */
+    int16_t *enc;                       /* indice base-`levels` della n-upla -> codice, -1 se non ammessa */
+    double bits_per_weight;
+} aim_code;
+
+int  aim_code_init(aim_code *c, const char *name);   /* "t5", "q4", "s36", "sNK" (n pesi, <=K non nulli) */
+void aim_code_free(aim_code *c);
+int  aim_code_encode(const aim_code *c, const int8_t *vals);   /* -1 se non ammessa */
+
+/* Matrice con codice generico: stesso layout a tile di aim_t3_tiled (G = cols_pad/n).
+ * Se t->code == NULL la matrice e' t5 nativa e usa i kernel dedicati. */
+int  aim_code_quantize(const aim_code *c, const float *W, int rows, int cols, aim_t3_tiled *t);
+/* Pota le n-uple con troppi non nulli (toglie i |w| piu' piccoli) e codifica valori ternari gia' dati */
+int  aim_code_pack_ternary(const aim_code *c, const int8_t *T, const float *mag, int rows, int cols,
+                           const float *row_scale, aim_t3_tiled *t, long *pruned);
+void aim_code_gemv_lut(const aim_t3_tiled *t, const float *x, float *y);    /* LUT scalare generica */
+void aim_code_unpack_rows(const aim_t3_tiled *t, int r0, int nrows, int8_t *out, int ld);  /* righe -> int8 */
 
 #ifdef __cplusplus
 }

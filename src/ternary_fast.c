@@ -129,6 +129,7 @@ void aim_t3_gemv_lut_factored(const aim_t3_mat *m, const float *x, float *y)
 /* ------------------------------ C ---------------------------------- */
 int aim_t3_tile(const aim_t3_mat *m, aim_t3_tiled *t)
 {
+    memset(t, 0, sizeof *t);      /* code = NULL: ternario base 3 nativo */
     t->rows = m->rows; t->cols = m->cols; t->cols_pad = m->cols_pad; t->G = m->bytes_per_row;
     t->rows_pad = (m->rows + AIM_T3_TILE - 1) / AIM_T3_TILE * AIM_T3_TILE;
     size_t n = (size_t)t->rows_pad * t->G;
@@ -316,6 +317,7 @@ static void t3_task_fn(void *ctx, int tid, int nth)
 
 void aim_t3_gemv_simd(const aim_t3_tiled *t, const float *x, float *y)
 {
+    if (t->code) { aim_code_gemv_lut(t, x, y); return; }   /* codice generico: LUT scalare */
     const int G = t->G, cols = t->cols;
     if (!t3_chunk) {
         const char *e = getenv("AIM_CHUNK"); t3_chunk = e ? atoi(e) : -1;   /* -1: adattivo */

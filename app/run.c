@@ -39,7 +39,8 @@ int main(int argc, char **argv)
     fprintf(stderr, "thread: %d | modello: %d layer, hidden %d, inter %d, %d/%d head, vocab %d | %.0f MB in RAM "
                     "(%.0f MB ternari = %.2f bit/peso) | caricato in %.2f s\n",
             aim_pool_size(), m.n_layers, m.hidden, m.inter, m.n_heads, m.n_kv, m.vocab, m.blob_size / 1e6,
-            m.ternary_bytes / 1e6, 8.0 * m.ternary_bytes / (m.ternary_bytes * 5.0), aim_now_sec() - t0);
+            m.ternary_bytes / 1e6, m.code ? m.code->bits_per_weight : 1.6, aim_now_sec() - t0);
+    if (m.code) fprintf(stderr, "codice: %s (%d pesi/byte, %d codici, <=%d non nulli)\n", m.code->name, m.code->n, m.code->ncodes, m.code->kmax);
 
     if (check) {   /* confronto con tools/check.py */
         const aim_t3_tiled *t = &m.layers[0].qkv;

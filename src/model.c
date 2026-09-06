@@ -7,14 +7,16 @@
 #define ATTN_CHUNK 256   /* posizioni per item nell'attention */
 
 /* ---------------------------------------------------------------- load */
-static int read_t3(const uint8_t **p, const uint8_t *end, aim_t3_tiled *t)
+static int read_t3(const uint8_t **p, const uint8_t *end, aim_t3_tiled *t, const aim_code *code)
 {
     if (*p + 8 > end) return -1;
     int32_t rows, cols;
     memcpy(&rows, *p, 4); memcpy(&cols, *p + 4, 4); *p += 8;
     t->rows = rows; t->cols = cols;
-    t->cols_pad = (cols + AIM_T3_GROUP - 1) / AIM_T3_GROUP * AIM_T3_GROUP;
-    t->G = t->cols_pad / AIM_T3_GROUP;
+    int n = code ? code->n : AIM_T3_GROUP;
+    t->code = code;
+    t->cols_pad = (cols + n - 1) / n * n;
+    t->G = t->cols_pad / n;
     t->rows_pad = (rows + AIM_T3_TILE - 1) / AIM_T3_TILE * AIM_T3_TILE;
     size_t nd = (size_t)t->rows_pad * t->G, ns = (size_t)t->rows_pad * sizeof(float);
     if (*p + nd + ns > end) return -1;
@@ -36,8 +38,18 @@ int aim_model_load(const char *path, aim_model *m)
     fclose(f);
 
     const uint8_t *p = m->blob, *end = m->blob + sz;
-    if (memcmp(p, "AIMODEL1", 8) != 0) { fprintf(stderr, "magic errato\n"); return -1; }
-    p += 8;
+    const aim_code *code = NULL;
+    if (memcmp(p, "AIMODEL1", 8) == 0) { p += 8; }
+    else if (memcmp(p, "AIMODEL2", 8) == 0) {
+        p += 8;
+        char name[9]; memcpy(name, p, 8); name[8] = 0; p += 8;
+        for (int i = 7; i >= 0 && name[i] == ' '; i--) name[i] = 0;
+        if (strcmp(name, "t5") != 0) {
+            m->code = malloc(sizeof(aim_code));
+            if (aim_code_init(m->code, strdup(name))) { fprintf(stderr, "codice sconosciuto: %s\n", name); return -1; }
+            code = m->code;
+        }
+    } else { fprintf(stderr, "magic errato\n"); return -1; }
     int32_t hdr[8]; memcpy(hdr, p, 32); p += 32;
     m->n_layers = hdr[0]; m->hidden = hdr[1]; m->inter = hdr[2]; m->n_heads = hdr[3];
     m->n_kv = hdr[4]; m->head_dim = hdr[5]; m->vocab = hdr[6]; m->max_pos = hdr[7];
@@ -50,13 +62,13 @@ int aim_model_load(const char *path, aim_model *m)
     for (int l = 0; l < m->n_layers; l++) {
         aim_layer *L = &m->layers[l];
         L->ln1 = read_f32(&p, m->hidden);
-        if (read_t3(&p, end, &L->qkv)) return -1;
+        if (read_t3(&p, end, &L->qkv, code)) return -1;
         L->attn_sub = read_f32(&p, m->hidden);
-        if (read_t3(&p, end, &L->o)) return -1;
+        if (read_t3(&p, end, &L->o, code)) return -1;
         L->ln2 = read_f32(&p, m->hidden);
-        if (read_t3(&p, end, &L->gate_up)) return -1;
+        if (read_t3(&p, end, &L->gate_up, code)) return -1;
         L->ffn_sub = read_f32(&p, m->inter);
-        if (read_t3(&p, end, &L->down)) return -1;
+        if (read_t3(&p, end, &L->down, code)) return -1;
         m->ternary_bytes += (size_t)L->qkv.rows_pad * L->qkv.G + (size_t)L->o.rows_pad * L->o.G
                           + (size_t)L->gate_up.rows_pad * L->gate_up.G + (size_t)L->down.rows_pad * L->down.G;
     }
@@ -65,7 +77,11 @@ int aim_model_load(const char *path, aim_model *m)
     return 0;
 }
 
-void aim_model_free(aim_model *m) { free(m->layers); free(m->blob); memset(m, 0, sizeof *m); }
+void aim_model_free(aim_model *m)
+{
+    if (m->code) { aim_code_free(m->code); free(m->code); }
+    free(m->layers); free(m->blob); memset(m, 0, sizeof *m);
+}
 
 /* ---------------------------------------------------------------- ctx */
 int aim_ctx_init(aim_ctx *c, const aim_model *m, int max_ctx)

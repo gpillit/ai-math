@@ -5,7 +5,7 @@ ifeq ($(OS),Windows_NT)
 LDFLAGS += -lsynchronization
 endif
 
-SRC := src/semiring.c src/ternary.c src/ternary_fast.c src/ternary_gemm.c src/int8.c src/model.c src/pool.c src/util.c
+SRC := src/semiring.c src/ternary.c src/ternary_fast.c src/ternary_gemm.c src/codes.c src/int8.c src/model.c src/pool.c src/util.c
 OBJ := $(SRC:.c=.o)
 
 all: build/test build/bench build/run

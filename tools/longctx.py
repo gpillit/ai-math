@@ -22,7 +22,7 @@ def main():
     ids = ids[:ctx - n]
     exe = os.path.join("build", "run.exe" if os.name == "nt" else "run")
     env = dict(os.environ, AIM_ATTN=attn, AIM_BATCH="64")
-    r = subprocess.run([exe, "models/bitnet-2b-4t.aim", "--ids", ",".join(map(str, ids)), "-n", str(n), "--ctx", str(ctx)],
+    r = subprocess.run([exe, os.environ.get("AIM_MODEL", "models/bitnet-2b-4t.aim"), "--ids", ",".join(map(str, ids)), "-n", str(n), "--ctx", str(ctx)],
                        capture_output=True, text=True, env=env)
     for line in r.stderr.splitlines():
         if line.startswith(("prefill", "decode")):

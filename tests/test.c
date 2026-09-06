@@ -102,7 +102,45 @@ int main(void)
         free(X); free(Y);
     }
     aim_t3_tiled_free(&tl);
-    free(xi);
+
+    /* 8. codici generici */
+    {
+        aim_code ct5, cq4, cs36;
+        CHECK(aim_code_init(&ct5, "t5") == 0 && ct5.ncodes == 243, "codice t5: 243 codici");
+        CHECK(aim_code_init(&cq4, "q4") == 0 && cq4.ncodes == 256, "codice q4: 256 codici");
+        CHECK(aim_code_init(&cs36, "s36") == 0 && cs36.ncodes == 233, "codice s36: 233 codici (6 pesi, <=3 non nulli)");
+        /* t5 generico coincide con la base 3 nativa */
+        int same = 1;
+        for (int b = 0; b < 243; b++) for (int i = 0; i < 5; i++) if (ct5.dec[b][i] != aim_t3_decode[b][i]) same = 0;
+        CHECK(same, "t5 generico == decodifica base 3 nativa");
+        /* roundtrip encode/decode */
+        int rt = 1;
+        for (int b = 0; b < cs36.ncodes; b++) if (aim_code_encode(&cs36, cs36.dec[b]) != b) rt = 0;
+        CHECK(rt, "s36: encode(decode(b)) == b");
+        /* gemv generica e gemm generica == fp32 sulla matrice dequantizzata */
+        const aim_code *codes[2] = { &cq4, &cs36 };
+        for (int ci = 0; ci < 2; ci++) {
+            aim_t3_tiled tg;
+            CHECK(aim_code_quantize(codes[ci], W, rows, cols, &tg) == 0, "quantize generica");
+            float *Wq = malloc((size_t)rows * cols * sizeof(float));
+            int8_t *rowb = malloc((size_t)rows * tg.cols_pad);
+            aim_code_unpack_rows(&tg, 0, rows, rowb, tg.cols_pad);
+            for (int r = 0; r < rows; r++) for (int c = 0; c < cols; c++) Wq[(size_t)r * cols + c] = rowb[(size_t)r * tg.cols_pad + c] * tg.scale[r];
+            aim_gemv_f32(Wq, xi, y0, rows, cols);
+            aim_t3_gemv_simd(&tg, xi, y2);
+            char msg[64]; snprintf(msg, sizeof msg, "%s: gemv LUT generica == fp32 (x int8)", codes[ci]->name);
+            CHECK(aim_rel_err(y0, y2, rows) < 1e-5, msg);
+            int B = 3; float *X = malloc((size_t)B * cols * sizeof(float)), *Y = malloc((size_t)B * rows * sizeof(float));
+            for (int b = 0; b < B; b++) for (int c = 0; c < cols; c++) X[(size_t)b * cols + c] = (float)(((c + 11 * b) * 37) % 255 - 127);
+            aim_t3_gemm_simd(&tg, X, cols, B, Y, rows);
+            double worst = 0;
+            for (int b = 0; b < B; b++) { aim_gemv_f32(Wq, X + (size_t)b * cols, y0, rows, cols); double e = aim_rel_err(y0, Y + (size_t)b * rows, rows); if (e > worst) worst = e; }
+            snprintf(msg, sizeof msg, "%s: gemm generica == fp32 (x int8)", codes[ci]->name);
+            CHECK(worst < 1e-5, msg);
+            free(Wq); free(rowb); free(X); free(Y); free(tg.data); free(tg.scale);
+        }
+        aim_code_free(&ct5); aim_code_free(&cq4); aim_code_free(&cs36);
+    }
 
     /* 7. bit per peso */
     double bpw = 8.0 * m.rows * m.bytes_per_row / ((double)rows * cols);
@@ -110,6 +148,7 @@ int main(void)
     CHECK(bpw < 1.7, "packing < 1.7 bit/peso");
 
     aim_t3_free(&m);
+    free(xi);
     free(W); free(Wd); free(x); free(y0); free(y1); free(y2); free(y3);
     printf(fails ? "\n%d TEST FALLITI\n" : "\nTUTTI I TEST PASSANO\n", fails);
     return fails ? 1 : 0;

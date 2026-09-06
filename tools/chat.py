@@ -26,7 +26,7 @@ def main():
     eos = [tok.eos_token_id] + [tok.convert_tokens_to_ids(t) for t in ("<|eot_id|>",) if t in tok.get_vocab()]
 
     exe = os.path.join("build", "run.exe" if os.name == "nt" else "run")
-    cmd = [exe, "models/bitnet-2b-4t.aim", "--ids", ",".join(map(str, ids)), "-n", str(n_new),
+    cmd = [exe, os.environ.get("AIM_MODEL", "models/bitnet-2b-4t.aim"), "--ids", ",".join(map(str, ids)), "-n", str(n_new),
            "--eos", ",".join(map(str, eos))]
     print("prompt ids:", len(ids), file=sys.stderr)
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)

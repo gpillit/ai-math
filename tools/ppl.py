@@ -20,7 +20,7 @@ TEXTS = {
 def run_one(tok, exe, text, attn):
     ids = tok(text)["input_ids"]
     env = dict(os.environ, AIM_ATTN=attn)
-    r = subprocess.run([exe, "models/bitnet-2b-4t.aim", "--ids", ",".join(map(str, ids)), "--ppl"],
+    r = subprocess.run([exe, os.environ.get("AIM_MODEL", "models/bitnet-2b-4t.aim"), "--ids", ",".join(map(str, ids)), "--ppl"],
                        capture_output=True, text=True, env=env)
     return float(r.stdout.split()[-1]), len(ids) - 1
 
@@ -43,7 +43,7 @@ def main():
         return
     ids = tok(text)["input_ids"]
     env = dict(os.environ, AIM_ATTN=attn)
-    r = subprocess.run([exe, "models/bitnet-2b-4t.aim", "--ids", ",".join(map(str, ids)), "--ppl"],
+    r = subprocess.run([exe, os.environ.get("AIM_MODEL", "models/bitnet-2b-4t.aim"), "--ids", ",".join(map(str, ids)), "--ppl"],
                        capture_output=True, text=True, env=env)
     print(r.stderr.strip().splitlines()[-1] if r.stderr.strip() else r.stdout.strip())
 

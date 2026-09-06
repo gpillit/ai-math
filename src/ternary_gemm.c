@@ -42,6 +42,20 @@ typedef struct {
  *   row(k,l) = l < 4 ? 4k + l : 16 + 4k + (l - 4)                        */
 static inline int w4_row(int k, int l) { return l < 4 ? 4 * k + l : 16 + 4 * k + (l - 4); }
 
+/* unpack generico: righe int8 dalla tabella del codice, poi layout W4 */
+static void unpack_tile_generic(const aim_t3_tiled *t, int tile, int cols20, int8_t *W4, int8_t *rowbuf)
+{
+    memset(rowbuf, 0, (size_t)AIM_T3_TILE * cols20);
+    int r0 = tile * AIM_T3_TILE, nr = t->rows_pad - r0 < AIM_T3_TILE ? t->rows_pad - r0 : AIM_T3_TILE;
+    aim_code_unpack_rows(t, r0, nr, rowbuf, cols20);
+    for (int j = 0; j < cols20 / 4; j++)
+        for (int k = 0; k < 4; k++)
+            for (int l = 0; l < 8; l++) {
+                int r = w4_row(k, l);
+                memcpy(W4 + (size_t)j * 128 + k * 32 + l * 4, rowbuf + (size_t)r * cols20 + 4 * j, 4);
+            }
+}
+
 static void unpack_tile(const aim_t3_tiled *t, int tile, int cols20, int8_t *W4)
 {
     const int G = t->G;
@@ -104,10 +118,12 @@ static void gemm_task_fn(void *ctx, int tid, int nth)
     const aim_t3_tiled *t = k->t;
     const int cols20 = k->cols20, nblk = cols20 / 4, ntiles = t->rows_pad / AIM_T3_TILE, B = k->B;
     int8_t *W4 = _mm_malloc((size_t)nblk * 128, 32);
+    int8_t *rowbuf = t->code ? malloc((size_t)AIM_T3_TILE * cols20) : NULL;
     const __m256i x128 = _mm256_set1_epi8((char)128);
 
     for (int tile; (tile = aim_pool_next(&k->next, 1)) < ntiles;) {
-        unpack_tile(t, tile, cols20, W4);
+        if (t->code) unpack_tile_generic(t, tile, cols20, W4, rowbuf);
+        else unpack_tile(t, tile, cols20, W4);
 
         __m256i corr[4] = { _mm256_setzero_si256(), _mm256_setzero_si256(), _mm256_setzero_si256(), _mm256_setzero_si256() };
         for (int j = 0; j < nblk; j++) {
@@ -135,6 +151,7 @@ static void gemm_task_fn(void *ctx, int tid, int nth)
         }
     }
     _mm_free(W4);
+    free(rowbuf);
 }
 
 void aim_t3_gemm_simd(const aim_t3_tiled *t, const float *X, int ldx, int B, float *Y, int ldy)
