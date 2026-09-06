@@ -62,6 +62,8 @@ kernel diversi a seconda del regime:
 | `tools/convert.py` | HuggingFace safetensors → formato `.aim` (ternario a tile, embedding int8) |
 | `tools/chat.py` | tokenizza con chat template, lancia `run`, decodifica |
 | `tools/ref_forward.py` | forward di riferimento in numpy per verificare il C layer per layer |
+| `tools/ppl.py` | perplexity su quattro testi, con il semianello dell'attention scelto |
+| `tools/longctx.py` | decode a contesto lungo: ms/token dell'attention per semianello |
 | `tests/test.c` | 16 test: biiezione della codifica, kernel == fp32, semianelli, esattezza SIMD |
 | `bench/bench.c` | banda effettiva e compressione dei kernel |
 
@@ -94,7 +96,7 @@ nel prefill, default 32), `AIM_DUMP=1` stampa stato e top-5 per posizione
 | decode | **30.7 ms/token (32.6 tok/s)** con 12 thread, 29.4 ms con 10 |
 | di cui | GEMV ternari 20-22 ms (19-21 GB/s), lm_head 8.3 ms (39 GB/s, al tetto), attention 0.5 ms |
 | prefill | **9.6-11 ms/token (90-105 tok/s)** con batch 64 (`AIM_BATCH`, default 32); batch 1: 32 tok/s |
-| di cui | GEMM 8-9.5 ms, attention 0.7 ms (scalare, cresce col contesto) |
+| di cui | GEMM 8-9.5 ms, attention 0.7-1 ms (AVX2, cresce col contesto) |
 
 ### Kernel isolato, 4096×4096 (un GEMV = un token su un layer)
 
@@ -109,6 +111,68 @@ nel prefill, default 32), `AIM_DUMP=1` stampa stato e top-5 per posizione
 Regime DRAM (54 MB): 1.42 ms, **38 GB/s**, cioè il tetto di banda della
 macchina. Il kernel isolato è RAM-bound; nel modello le matrici sono più
 piccole (1.3-7 MB) e la coda degli E-core lenti costa ancora un fattore ~2.
+
+## Esperimento 1: il semianello dell'attention
+
+L'attention è un prodotto in un semianello: i punteggi q·k si combinano con
+⊕ e i valori si pesano di conseguenza. Con (logsumexp, +) è la softmax;
+con (max, +) è l'attention tropicale, che prende solo l'argmax. Tra i due
+c'è la famiglia continua di Maslov, ⊕ₕ(a,b) = h·log(e^{a/h} + e^{b/h}):
+h = 1 è la softmax, h → 0 è il max. Tutto questo si cambia a inferenza,
+senza riaddestrare (`AIM_ATTN=softmax|max|topk=K|h=X`, `tools/ppl.py`).
+
+Perplexity di BitNet 2B-4T su quattro testi di generi diversi
+(`tools/ppl.py --all`):
+
+| testo | token | softmax | (max,+) | top-8 | top-32 | h=0.85 | h=0.7 |
+|---|---|---|---|---|---|---|---|
+| storia | 299 | 6.43 | 20.55 | 6.55 | **6.40** | 6.39 | 6.61 |
+| codice | 310 | 1.76 | 3.98 | 1.81 | **1.76** | 1.78 | 1.80 |
+| dialogo | 227 | 11.09 | 36.96 | 11.83 | **10.99** | 11.32 | 11.69 |
+| scienza | 246 | 4.99 | 16.05 | 5.33 | **4.98** | 5.06 | 5.23 |
+
+Scansione della famiglia di Maslov sul testo "storia":
+
+| h | 0.25 | 0.5 | 0.7 | 0.85 | 1.0 | 1.15 | 1.3 | 1.6 | 2.0 |
+|---|---|---|---|---|---|---|---|---|---|
+| ppl | 8.26 | 7.00 | 6.61 | 6.39 | 6.43 | 6.54 | 6.68 | 7.28 | 11.55 |
+
+Cosa dice:
+
+1. **Il semianello tropicale puro non è sostituibile a inferenza** in un
+   modello addestrato con la softmax: perplexity da 2.3× a 3.3× su tutti i
+   testi.
+2. **La massa dell'attention è concentrata, ma non in 8 chiavi**: top-8
+   costa dall'1.7% (storia) al 7% (dialogo, scienza). **Top-32 è uguale o
+   leggermente migliore della softmax su tutti e quattro i testi** (da
+   −0.1% a −0.9%): tagliare la coda lunga dei punteggi non toglie niente e
+   forse toglie rumore.
+3. **h = 0.85 non generalizza**: batte la softmax solo su "storia" e perde
+   sugli altri tre. Era un effetto del singolo testo. Il modello sta dove è
+   stato addestrato, h = 1, e la curva è asimmetrica: verso il max (h → 0)
+   degrada lentamente, verso l'uniforme (h = 2) crolla.
+
+Il top-k a inferenza non è nuovo (attention sparsa, Quest e simili); la
+scansione della famiglia di Maslov come misura di "quanto tropicale" può
+essere un modello è la parte da approfondire.
+
+### Top-k applicato alla KV cache, a contesto lungo
+
+Con 2048 token di contesto la KV cache (315 MB in fp32) supera i pesi
+ternari (417 MB) come termine di banda per token. Decode a 2048 token,
+misurato con `tools/longctx.py`:
+
+| attention | attention ms/token | decode tok/s | prefill tok/s |
+|---|---|---|---|
+| softmax, kernel iniziale (scalare, un item per head) | 45.1 | 10.2 | 38.8 |
+| softmax, kernel a 3 fasi (GQA 4 head per riga K, exp AVX2, chunk di 256 posizioni, cache [layer][kv-head][pos]) | 25.8 | 14.1 | 51.9 |
+| top-32, kernel a 3 fasi | **10.1** | **18.8** | **63.0** |
+
+Con top-32 la fase 3 legge solo le 32 righe di V che contano; K va letta
+tutta per calcolare i punteggi (10 ms ≈ 5 MB/layer di K a ~15 GB/s). Per
+andare oltre servono K in fp16 o un indice sulle chiavi (stile Quest).
+Il kernel è verificato contro il forward numpy: stessi top-5 in ogni
+posizione, logit entro l'arrotondamento int8.
 
 ## Cose imparate (che non si trovano nei paper)
 
@@ -135,15 +199,18 @@ Si chiama "nuova" solo dopo il punto 4 e solo se batte le baseline.
 
 Vicini di casa da conoscere (non nuovi): LUT-GEMM, T-MAC, BitNet b1.58 e i
 kernel TL1/TL2 di bitnet.cpp, quantizzazione su reticoli (QuIP#, AQLM).
-La fattorizzazione 27×9 della tabella base-3 è la parte da verificare in
+**Il packing di 5 trit per byte esiste già**: è il tipo `TQ1_0` di ggml /
+llama.cpp (1.69 bit/peso), che decodifica moltiplicando per 3 e leggendo il
+riporto. Quello che lì non c'è è la fattorizzazione Z₃⁵ = Z₃³ × Z₃² della
+tabella di lookup (27×9) con `vpshufb`: è la parte da verificare in
 letteratura prima di chiamarla nuova.
 
 ## Prossimi passi candidati
 
 1. Confronto diretto con bitnet.cpp sulla stessa macchina. Richiede cmake e
    clang (non installati) e il suo generatore di kernel; non ancora fatto.
-2. Attention vettorizzata (oggi scalare: 0.7 ms/token nel prefill a 126
-   token, cresce con il contesto).
-3. Cambio di semianello dentro il modello: layer in (max,+), niente
-   moltiplicazioni né tabelle. Richiede fine-tuning.
+2. KV cache in fp16 (F16C c'è) e indice sulle chiavi per non leggere tutta
+   K con il top-k; esperimento 1 su un modello più grande.
+3. Cambio di semianello nell'MLP (relu² in (max,+)): richiede fine-tuning,
+   quindi PyTorch e un modello piccolo.
 4. Pesi su reticoli non cubici (esagonale / Eisenstein): più precisione per bit.

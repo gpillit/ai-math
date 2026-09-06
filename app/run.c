@@ -21,13 +21,14 @@ static int parse_ids(const char *s, int *out, int max)
 int main(int argc, char **argv)
 {
     if (argc < 2) { fprintf(stderr, "uso: %s model.aim --ids 1,2,3 [-n N] [--eos a,b] [--ctx C]\n", argv[0]); return 1; }
-    int ids[4096], n_ids = 0, eos[8], n_eos = 0, n_new = 64, ctx = 1024, check = 0;
+    int ids[8192], n_ids = 0, eos[8], n_eos = 0, n_new = 64, ctx = 1024, check = 0, ppl = 0;
     for (int i = 2; i < argc; i++) {
-        if (!strcmp(argv[i], "--ids") && i + 1 < argc) n_ids = parse_ids(argv[++i], ids, 4096);
+        if (!strcmp(argv[i], "--ids") && i + 1 < argc) n_ids = parse_ids(argv[++i], ids, 8192);
         else if (!strcmp(argv[i], "--eos") && i + 1 < argc) n_eos = parse_ids(argv[++i], eos, 8);
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) n_new = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--check")) check = 1;
+        else if (!strcmp(argv[i], "--ppl")) ppl = 1;
     }
     if (!n_ids && !check) { fprintf(stderr, "nessun token in input\n"); return 1; }
 
@@ -55,6 +56,17 @@ int main(int argc, char **argv)
     aim_ctx c;
     if (aim_ctx_init(&c, &m, ctx)) { fprintf(stderr, "ctx alloc fallita\n"); return 1; }
 
+    if (ppl) {
+        const char *eb = getenv("AIM_BATCH"); int batch = eb ? atoi(eb) : 32; if (batch < 1) batch = 1;
+        t0 = aim_now_sec();
+        double v = aim_perplexity(&c, ids, n_ids, batch);
+        printf("ppl %.4f\n", v);
+        fprintf(stderr, "perplexity su %d token: %.4f  (%.2f s, attn=%s)\n", n_ids - 1, v, aim_now_sec() - t0,
+                getenv("AIM_ATTN") ? getenv("AIM_ATTN") : "softmax");
+        aim_ctx_free(&c); aim_model_free(&m); aim_pool_shutdown();
+        return 0;
+    }
+
     /* prefill: un token alla volta */
     t0 = aim_now_sec();
     const float *logits = NULL;
@@ -77,6 +89,8 @@ int main(int argc, char **argv)
         i++;
     }
     double t_prefill = aim_now_sec() - t0;
+    double pf_gemv = c.t_gemv, pf_attn = c.t_attn, pf_head = c.t_head;
+    c.t_gemv = c.t_attn = c.t_head = 0; for (int k = 0; k < 4; k++) c.t_kind[k] = 0;
 
     /* decode greedy */
     t0 = aim_now_sec();
@@ -96,9 +110,11 @@ int main(int argc, char **argv)
     fprintf(stderr, "prefill: %d token in %.2f s (%.1f tok/s, batch %d)\n", n_ids, t_prefill, n_ids / t_prefill, batch);
     fprintf(stderr, "decode : %d token in %.2f s (%.1f tok/s, %.1f ms/token)\n",
             generated, t_dec, dec_steps / t_dec, 1e3 * t_dec / dec_steps);
-    double steps = n_ids + dec_steps;   /* medie su prefill+decode (il prefill a batch le abbassa) */
-    fprintf(stderr, "per token: gemv ternari %.1f ms, attention %.1f ms, lm_head %.1f ms\n",
-            1e3 * c.t_gemv / steps, 1e3 * c.t_attn / steps, 1e3 * c.t_head / steps);
+    fprintf(stderr, "prefill per token: gemm %.1f ms, attention %.2f ms, lm_head %.2f ms\n",
+            1e3 * pf_gemv / n_ids, 1e3 * pf_attn / n_ids, 1e3 * pf_head / n_ids);
+    double steps = dec_steps;   /* statistiche del solo decode */
+    fprintf(stderr, "decode  per token: gemv %.1f ms, attention %.2f ms, lm_head %.1f ms  (ctx %d)\n",
+            1e3 * c.t_gemv / steps, 1e3 * c.t_attn / steps, 1e3 * c.t_head / steps, c.pos);
     fprintf(stderr, "banda pesi ternari nei gemv: %.1f GB/s\n", m.ternary_bytes / (c.t_gemv / steps) / 1e9);
 
     {

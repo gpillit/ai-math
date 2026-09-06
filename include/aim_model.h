@@ -31,7 +31,7 @@ typedef struct {
     const aim_model *m;
     int max_ctx, pos;
     float *k_cache, *v_cache;   /* [layer][pos][n_kv*head_dim] */
-    float *x, *xb, *qkv, *att, *attn, *gu, *h, *logits;
+    float *x, *xb, *qkv, *att, *attn, *gu, *h, *logits, *part;
     float *rope_cos, *rope_sin; /* [max_ctx][head_dim/2] */
     double t_gemv, t_attn, t_head;   /* profiling cumulativo (secondi) */
     double t_kind[4];                /* qkv, o, gate_up, down */
@@ -45,6 +45,9 @@ void  aim_ctx_free(aim_ctx *c);
 const float *aim_forward(aim_ctx *c, int token);
 /* B token in batch (prefill): ritorna i logit dell'ultimo, avanza pos di B */
 const float *aim_forward_batch(aim_ctx *c, const int *tokens, int B);
+const float *aim_forward_batch_logits(aim_ctx *c, const int *tokens, int B, float *all_logits);
+/* log-perplexity media di ids[1..n-1] dati i precedenti (teacher forcing) */
+double aim_perplexity(aim_ctx *c, const int *ids, int n, int batch);
 int   aim_argmax(const float *v, int n);
 
 /* GEMV int8 (pesi int8 per riga con scala, attivazioni int8 per-tensore) */
